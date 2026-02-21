@@ -11,6 +11,7 @@ const {
   HISTORY_INTERVAL,
   LIVE_ENTRY_MODE,
   LIVE_GTX_FALLBACK_MARKET,
+  LIVE_INCOME_LOOKBACK_HOURS,
   LIVE_GTX_POLL_MS,
   LIVE_GTX_TIMEOUT_MS,
   LIVE_SPREAD_MAX_BPS_BY_SYMBOL,
@@ -70,6 +71,7 @@ const LIVE_TRADING_CONFIG = {
   gtxTimeoutMs: LIVE_GTX_TIMEOUT_MS,
   gtxPollMs: LIVE_GTX_POLL_MS,
   gtxFallbackMarket: LIVE_GTX_FALLBACK_MARKET,
+  incomeLookbackMs: LIVE_INCOME_LOOKBACK_HOURS * 60 * 60 * 1000,
   spreadMaxBpsDefault: LIVE_SPREAD_MAX_BPS_DEFAULT,
   spreadMaxBpsByMarketSymbol: LIVE_SPREAD_MAX_BPS_BY_MARKET_SYMBOL,
   marginUsd: SIM_MARGIN_USD,
@@ -658,6 +660,11 @@ function render(rows) {
         const controlText = liveControl
           ? `sl -${liveControl.stopLossRoiPct.toFixed(2)}% | trail ${liveControl.trailingArmed ? 'ON' : 'OFF'} (act ${liveControl.trailActivateRoiPct.toFixed(2)}% / dd ${liveControl.trailDdRoiPct.toFixed(2)}%) | peakROI ${Number.isFinite(liveControl.peakRoiPct) ? liveControl.peakRoiPct.toFixed(2) : '0.00'}%`
           : 'risk profile unavailable'
+        const trades = liveIncome.trades || 0
+        const wins = liveIncome.wins || 0
+        const losses = liveIncome.losses || 0
+        const winRate = trades > 0 ? (wins / trades) * 100 : 0
+        const lastRealized = liveIncome.lastRealizedAt > 0 ? `${liveIncome.lastRealizedPnlUsd >= 0 ? '+' : ''}$${liveIncome.lastRealizedPnlUsd.toFixed(4)}` : 'none'
 
         console.log(
           `${symbol} LIVE ${livePosition.side.toUpperCase()} | ` +
@@ -667,19 +674,31 @@ function render(rows) {
             `margin ${(livePosition.marginType || 'UNKNOWN').toUpperCase()} | ` +
             `gross ${grossSign}$${gross.toFixed(4)} | ` +
             `netEst ${netSign}$${net.toFixed(4)} (${roiPct.toFixed(2)}%) | ` +
+            `trades ${wins}/${trades}W (${winRate.toFixed(1)}%) L${losses} | ` +
+            `lastRealized ${lastRealized} | ` +
             `${controlText} | ` +
             `action ${liveLastAction}`,
         )
       } else {
         const net = liveIncome.netUsd || 0
         const sign = net >= 0 ? '+' : ''
+        const trades = liveIncome.trades || 0
+        const wins = liveIncome.wins || 0
+        const losses = liveIncome.losses || 0
+        const winRate = trades > 0 ? (wins / trades) * 100 : 0
+        const grossRealized = liveIncome.realizedPnlUsd || 0
+        const grossSign = grossRealized >= 0 ? '+' : ''
+        const lastRealized = liveIncome.lastRealizedAt > 0 ? `${liveIncome.lastRealizedPnlUsd >= 0 ? '+' : ''}$${liveIncome.lastRealizedPnlUsd.toFixed(4)}` : 'none'
         const intentText = liveEntryIntent ? `pending ${liveEntryIntent.side.toUpperCase()}` : 'pending -'
         console.log(
           `${symbol} LIVE IDLE | ` +
-            `realized ${(liveIncome.realizedPnlUsd || 0) >= 0 ? '+' : ''}$${(liveIncome.realizedPnlUsd || 0).toFixed(4)} | ` +
+            `realizedGross ${grossSign}$${grossRealized.toFixed(4)} | ` +
             `commission $${(liveIncome.commissionUsd || 0).toFixed(4)} | ` +
             `funding $${(liveIncome.fundingUsd || 0).toFixed(4)} | ` +
             `net ${sign}$${net.toFixed(4)} | ` +
+            `win ${wins}/${trades} (${winRate.toFixed(1)}%) | ` +
+            `lose ${losses} | ` +
+            `lastRealized ${lastRealized} | ` +
             `events ${liveIncome.events || 0} | ` +
             `${intentText} | ` +
             `action ${liveLastAction}`,

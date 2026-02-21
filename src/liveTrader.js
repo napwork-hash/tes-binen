@@ -39,6 +39,24 @@ function parseBinanceErrorCode(error) {
   return Number.isFinite(code) ? code : null
 }
 
+function createEmptyIncomeStats() {
+  return {
+    realizedPnlUsd: 0,
+    commissionUsd: 0,
+    fundingUsd: 0,
+    netUsd: 0,
+    events: 0,
+    trades: 0,
+    wins: 0,
+    losses: 0,
+    breakeven: 0,
+    grossWinUsd: 0,
+    grossLossUsd: 0,
+    lastRealizedPnlUsd: 0,
+    lastRealizedAt: 0,
+  }
+}
+
 class LiveTrader {
   constructor(options = {}) {
     this.enable = Boolean(options.enable)
@@ -71,7 +89,8 @@ class LiveTrader {
     this.positionSnapshot = new Map() // marketSymbolUpper -> { side, quantity, entryPrice, markPrice, unrealizedPnlUsd, notionalUsd, marginUsd }
     this.incomeStats = new Map() // marketSymbolUpper -> { realizedPnlUsd, commissionUsd, fundingUsd, netUsd, events }
     this.lastActionBySymbol = new Map() // marketSymbolUpper -> short last action text
-    this.incomeCursorTs = Date.now() - 60_000
+    const incomeLookbackMs = Math.max(60_000, toNumber(options.incomeLookbackMs, 24 * 60 * 60 * 1000))
+    this.incomeCursorTs = Date.now() - incomeLookbackMs
     this.seenIncomeKeys = new Set()
 
     this.lastError = null
@@ -648,46 +667,63 @@ class LiveTrader {
     if (!this.enable || !this.hasCredentials()) return
 
     const symbolsSet = new Set((marketSymbols || []).map((s) => String(s).toUpperCase()))
-    const rows = await this.requestSigned('GET', '/fapi/v1/income', {
-      startTime: this.incomeCursorTs,
-      limit: 1000,
-    })
-    if (!Array.isArray(rows)) return
-
+    let cursor = this.incomeCursorTs
     let maxTs = this.incomeCursorTs
-    for (const it of rows) {
-      const symbol = String(it?.symbol || '').toUpperCase()
-      if (!symbol) continue
-      if (symbolsSet.size > 0 && !symbolsSet.has(symbol)) continue
 
-      const ts = toNumber(it?.time, 0)
-      if (ts > maxTs) maxTs = ts
+    while (true) {
+      const rows = await this.requestSigned('GET', '/fapi/v1/income', {
+        startTime: cursor,
+        limit: 1000,
+      })
+      if (!Array.isArray(rows) || rows.length === 0) break
 
-      const key = `${it?.tranId ?? 'na'}:${symbol}:${it?.incomeType ?? 'NA'}:${ts}:${it?.income ?? '0'}`
-      if (this.seenIncomeKeys.has(key)) continue
-      this.seenIncomeKeys.add(key)
+      for (const it of rows) {
+        const symbol = String(it?.symbol || '').toUpperCase()
+        if (!symbol) continue
+        if (symbolsSet.size > 0 && !symbolsSet.has(symbol)) continue
 
-      const incomeType = String(it?.incomeType || '')
-      const incomeUsd = toNumber(it?.income, 0)
+        const ts = toNumber(it?.time, 0)
+        if (ts > maxTs) maxTs = ts
 
-      const stats =
-        this.incomeStats.get(symbol) ??
-        {
-          realizedPnlUsd: 0,
-          commissionUsd: 0,
-          fundingUsd: 0,
-          netUsd: 0,
-          events: 0,
+        const key = `${it?.tranId ?? 'na'}:${symbol}:${it?.incomeType ?? 'NA'}:${ts}:${it?.income ?? '0'}`
+        if (this.seenIncomeKeys.has(key)) continue
+        this.seenIncomeKeys.add(key)
+
+        const incomeType = String(it?.incomeType || '')
+        const incomeUsd = toNumber(it?.income, 0)
+
+        const stats = this.incomeStats.get(symbol) ?? createEmptyIncomeStats()
+
+        if (incomeType === 'REALIZED_PNL') {
+          stats.realizedPnlUsd += incomeUsd
+          stats.trades += 1
+
+          if (incomeUsd > 0) {
+            stats.wins += 1
+            stats.grossWinUsd += incomeUsd
+          } else if (incomeUsd < 0) {
+            stats.losses += 1
+            stats.grossLossUsd += Math.abs(incomeUsd)
+          } else {
+            stats.breakeven += 1
+          }
+
+          stats.lastRealizedPnlUsd = incomeUsd
+          stats.lastRealizedAt = ts
+        } else if (incomeType === 'COMMISSION') {
+          stats.commissionUsd += incomeUsd
+        } else if (incomeType === 'FUNDING_FEE') {
+          stats.fundingUsd += incomeUsd
         }
 
-      if (incomeType === 'REALIZED_PNL') stats.realizedPnlUsd += incomeUsd
-      else if (incomeType === 'COMMISSION') stats.commissionUsd += incomeUsd
-      else if (incomeType === 'FUNDING_FEE') stats.fundingUsd += incomeUsd
+        stats.netUsd += incomeUsd
+        stats.events += 1
 
-      stats.netUsd += incomeUsd
-      stats.events += 1
+        this.incomeStats.set(symbol, stats)
+      }
 
-      this.incomeStats.set(symbol, stats)
+      if (rows.length < 1000) break
+      cursor = maxTs + 1
     }
 
     this.incomeCursorTs = maxTs + 1
@@ -698,15 +734,7 @@ class LiveTrader {
   }
 
   getIncomeStats(symbolUpper) {
-    return (
-      this.incomeStats.get(String(symbolUpper || '').toUpperCase()) ?? {
-        realizedPnlUsd: 0,
-        commissionUsd: 0,
-        fundingUsd: 0,
-        netUsd: 0,
-        events: 0,
-      }
-    )
+    return this.incomeStats.get(String(symbolUpper || '').toUpperCase()) ?? createEmptyIncomeStats()
   }
 
   getLastAction(symbolUpper) {
