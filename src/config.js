@@ -46,6 +46,7 @@ const SIM_FEE_RATE_PCT = numEnv('SIM_FEE_RATE_PCT', 0.05)
 // Live trading (disabled by default)
 const LIVE_TRADING_ENABLE = (process.env.LIVE_TRADING_ENABLE ?? '0') === '1'
 const LIVE_TRADING_TESTNET = (process.env.LIVE_TRADING_TESTNET ?? '0') === '1'
+const LIVE_TRADING_FORCE_ISOLATED = (process.env.LIVE_TRADING_FORCE_ISOLATED ?? '1') === '1'
 
 const BINANCE_FUTURES_REST_BASE = process.env.BINANCE_FUTURES_REST_BASE || 'https://fapi.binance.com'
 const BINANCE_FUTURES_WS_BASE = process.env.BINANCE_FUTURES_WS_BASE || 'wss://fstream.binance.com/stream?streams='
@@ -77,6 +78,7 @@ module.exports = {
   RECONNECT_MAX_MS,
   RENDER_INTERVAL_MS,
   LIVE_TRADING_ENABLE,
+  LIVE_TRADING_FORCE_ISOLATED,
   LIVE_TRADING_TESTNET,
   SIM_FEE_RATE_PCT,
   SIM_LEVERAGE,

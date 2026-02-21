@@ -40,10 +40,12 @@ class LiveTrader {
 
     this.marginUsd = Math.max(0.1, toNumber(options.marginUsd, 1))
     this.leverage = Math.min(20, Math.max(1, Math.floor(toNumber(options.leverage, 20))))
+    this.forceIsolated = options.forceIsolated !== false
 
     this.baseUrl = options.baseUrl || (this.testnet ? 'https://testnet.binancefuture.com' : 'https://fapi.binance.com')
 
     this.symbolMeta = new Map() // marketSymbolUpper -> { minQty, stepSize }
+    this.marginTypeBySymbol = new Map() // marketSymbolUpper -> ISOLATED/CROSSED/UNKNOWN
     this.maxLeverageBySymbol = new Map() // marketSymbolUpper -> max leverage from bracket
     this.effectiveLeverageBySymbol = new Map() // marketSymbolUpper -> leverage actually set/used
     this.activePositions = new Map() // marketSymbolUpper -> { side, quantity }
@@ -56,13 +58,16 @@ class LiveTrader {
 
     this.lastError = null
     this.ready = false
+    this.isDualSidePosition = false
   }
 
   getStatus() {
     if (!this.enable) return 'OFF'
     if (!this.apiKey || !this.apiSecret) return 'ON (missing keys)'
     if (!this.ready) return 'ON (init...)'
-    return this.testnet ? 'ON TESTNET' : 'ON REAL'
+    const posMode = this.isDualSidePosition ? 'HEDGE' : 'ONEWAY'
+    const marginMode = this.forceIsolated ? 'ISOLATED' : 'MARGIN-AUTO'
+    return `${this.testnet ? 'ON TESTNET' : 'ON REAL'} | ${posMode} | ${marginMode}`
   }
 
   isEnabled() {
@@ -83,6 +88,7 @@ class LiveTrader {
     try {
       const symbolsUpper = (marketSymbols || []).map((s) => String(s).toUpperCase()).filter(Boolean)
 
+      await this.loadPositionMode()
       await this.loadExchangeInfo(symbolsUpper)
 
       try {
@@ -91,6 +97,7 @@ class LiveTrader {
         // leverage bracket is best-effort; we still can continue with fallback candidates
       }
 
+      await Promise.all(symbolsUpper.map(async (symbolUpper) => this.configureMarginType(symbolUpper)))
       await Promise.all(symbolsUpper.map(async (symbolUpper) => this.configureLeverage(symbolUpper)))
       await this.syncRuntime(symbolsUpper)
       this.ready = true
@@ -122,6 +129,45 @@ class LiveTrader {
       symbol: symbolUpper,
       leverage,
     })
+  }
+
+  async loadPositionMode() {
+    const data = await this.requestSigned('GET', '/fapi/v1/positionSide/dual')
+    const raw = data?.dualSidePosition
+    this.isDualSidePosition = raw === true || String(raw).toLowerCase() === 'true'
+  }
+
+  async setMarginTypeIsolated(symbolUpper) {
+    return this.requestSigned('POST', '/fapi/v1/marginType', {
+      symbol: symbolUpper,
+      marginType: 'ISOLATED',
+    })
+  }
+
+  async configureMarginType(symbolUpper) {
+    if (!this.forceIsolated) {
+      this.marginTypeBySymbol.set(symbolUpper, 'AUTO')
+      return 'AUTO'
+    }
+
+    try {
+      await this.setMarginTypeIsolated(symbolUpper)
+      this.marginTypeBySymbol.set(symbolUpper, 'ISOLATED')
+      return 'ISOLATED'
+    } catch (error) {
+      const code = parseBinanceErrorCode(error)
+      const message = String(error?.message || '')
+
+      // Already isolated on this symbol.
+      if (code === -4046 || message.includes('No need to change margin type.')) {
+        this.marginTypeBySymbol.set(symbolUpper, 'ISOLATED')
+        return 'ISOLATED'
+      }
+
+      // Could not switch now (often due existing position/order); keep running.
+      this.marginTypeBySymbol.set(symbolUpper, 'UNKNOWN')
+      return 'UNKNOWN'
+    }
   }
 
   async loadLeverageBrackets(marketSymbols = []) {
@@ -201,6 +247,11 @@ class LiveTrader {
     return qty
   }
 
+  getPositionSideParam(side) {
+    if (!this.isDualSidePosition) return null
+    return side === 'long' ? 'LONG' : 'SHORT'
+  }
+
   async openPosition(symbol, marketSymbol, side, price) {
     if (!this.enable || !this.ready) return null
 
@@ -216,13 +267,17 @@ class LiveTrader {
       if (!qty) throw new Error(`Quantity too small or invalid for ${symbolUpper}`)
 
       const orderSide = side === 'long' ? 'BUY' : 'SELL'
-      const result = await this.requestSigned('POST', '/fapi/v1/order', {
+      const positionSide = this.getPositionSideParam(side)
+      const orderParams = {
         symbol: symbolUpper,
         side: orderSide,
         type: 'MARKET',
         quantity: qty,
         newOrderRespType: 'RESULT',
-      })
+      }
+      if (positionSide) orderParams.positionSide = positionSide
+
+      const result = await this.requestSigned('POST', '/fapi/v1/order', orderParams)
 
       const executedQty = toNumber(result?.executedQty, qty)
       this.activePositions.set(symbolUpper, {
@@ -260,14 +315,21 @@ class LiveTrader {
       if (!qty) throw new Error(`Close quantity invalid for ${symbolUpper}`)
 
       const closeSide = active.side === 'long' ? 'SELL' : 'BUY'
-      const result = await this.requestSigned('POST', '/fapi/v1/order', {
+      const positionSide = this.getPositionSideParam(active.side)
+      const orderParams = {
         symbol: symbolUpper,
         side: closeSide,
         type: 'MARKET',
-        reduceOnly: 'true',
         quantity: qty,
         newOrderRespType: 'RESULT',
-      })
+      }
+      if (positionSide) {
+        orderParams.positionSide = positionSide
+      } else {
+        orderParams.reduceOnly = 'true'
+      }
+
+      const result = await this.requestSigned('POST', '/fapi/v1/order', orderParams)
 
       this.activePositions.delete(symbolUpper)
       this.lastActionBySymbol.set(symbolUpper, `CLOSE ${active.side.toUpperCase()} ok qty ${formatQty(qty)} #${result?.orderId ?? '-'}`)
@@ -355,6 +417,7 @@ class LiveTrader {
       const positionAmt = toNumber(p.positionAmt, 0)
       if (!Number.isFinite(positionAmt) || positionAmt === 0) continue
 
+      const positionSideRaw = String(p.positionSide || '').toUpperCase()
       const entryPrice = toNumber(p.entryPrice, 0)
       const markPrice = toNumber(p.markPrice, 0)
       const unrealizedPnlUsd = toNumber(p.unRealizedProfit, 0)
@@ -362,9 +425,18 @@ class LiveTrader {
       const marginUsd = Math.abs(toNumber(p.isolatedMargin, 0)) || this.marginUsd
       const leverage = Math.floor(toNumber(p.leverage, this.getEffectiveLeverage(symbol)))
       if (leverage > 0) this.effectiveLeverageBySymbol.set(symbol, Math.min(20, leverage))
+      const marginType = String(p.marginType || '').toUpperCase()
+      if (marginType) this.marginTypeBySymbol.set(symbol, marginType)
 
-      const side = positionAmt > 0 ? 'long' : 'short'
+      let side = positionAmt > 0 ? 'long' : 'short'
+      if (this.isDualSidePosition) {
+        if (positionSideRaw === 'LONG') side = 'long'
+        else if (positionSideRaw === 'SHORT') side = 'short'
+      }
       const quantity = Math.abs(positionAmt)
+
+      const existing = this.positionSnapshot.get(symbol)
+      if (existing && existing.notionalUsd >= notionalUsd) continue
 
       this.positionSnapshot.set(symbol, {
         side,
@@ -374,6 +446,7 @@ class LiveTrader {
         unrealizedPnlUsd,
         notionalUsd,
         marginUsd,
+        marginType: marginType || this.marginTypeBySymbol.get(symbol) || 'UNKNOWN',
       })
 
       this.activePositions.set(symbol, { side, quantity })

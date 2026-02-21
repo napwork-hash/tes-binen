@@ -10,6 +10,7 @@ const {
   HISTORY_CANDLES,
   HISTORY_INTERVAL,
   LIVE_TRADING_ENABLE,
+  LIVE_TRADING_FORCE_ISOLATED,
   LIVE_TRADING_TESTNET,
   MARKET_SYMBOLS,
   RECONNECT_BASE_MS,
@@ -54,6 +55,7 @@ const SIM_CONFIG = {
 const LIVE_TRADING_CONFIG = {
   enable: LIVE_TRADING_ENABLE,
   testnet: LIVE_TRADING_TESTNET,
+  forceIsolated: LIVE_TRADING_FORCE_ISOLATED,
   marginUsd: SIM_MARGIN_USD,
   leverage: SIM_LEVERAGE,
 }
@@ -646,6 +648,7 @@ function render(rows) {
             `entry ${formatPrice(livePosition.entryPrice)} | ` +
             `mark ${formatPrice(livePosition.markPrice)} | ` +
             `qty ${formatNumber(livePosition.quantity, 4)} | ` +
+            `margin ${(livePosition.marginType || 'UNKNOWN').toUpperCase()} | ` +
             `gross ${grossSign}$${gross.toFixed(4)} | ` +
             `netEst ${netSign}$${net.toFixed(4)} (${roiPct.toFixed(2)}%) | ` +
             `${controlText} | ` +
