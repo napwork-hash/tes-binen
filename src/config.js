@@ -25,22 +25,25 @@ const MARKET_SYMBOLS = Object.fromEntries(SYMBOLS.map((symbol) => [symbol, `${sy
 
 const HISTORY_INTERVAL = '5m'
 const HISTORY_CANDLES = numEnv('HISTORY_CANDLES', 72)
-const DECISION_WINDOW_MS = numEnv('DECISION_WINDOW_MS', 60_000)
+const DECISION_WINDOW_MS = numEnv('DECISION_WINDOW_MS', FIVE_MINUTES_MS)
 const RENDER_INTERVAL_MS = numEnv('RENDER_INTERVAL_MS', 1_000)
 
 // Simulation trade configuration
 const SIM_MARGIN_USD = numEnv('SIM_MARGIN_USD', 10)
 const SIM_LEVERAGE = numEnv('SIM_LEVERAGE', 20)
-const SIM_SL_ROI_PCT = numEnv('SIM_SL_ROI_PCT', 30)
-const SIM_TRAIL_ACTIVATE_ROI_PCT = numEnv('SIM_TRAIL_ACTIVATE_ROI_PCT', 10)
-const SIM_TRAIL_DD_ROI_PCT = numEnv('SIM_TRAIL_DD_ROI_PCT', 3)
+const SIM_SL_ROI_MIN_PCT = numEnv('SIM_SL_ROI_MIN_PCT', 8)
+const SIM_SL_ROI_MAX_PCT = numEnv('SIM_SL_ROI_MAX_PCT', 15)
+const SIM_TRAIL_ACTIVATE_ROI_MIN_PCT = numEnv('SIM_TRAIL_ACTIVATE_ROI_MIN_PCT', 10)
+const SIM_TRAIL_ACTIVATE_ROI_MAX_PCT = numEnv('SIM_TRAIL_ACTIVATE_ROI_MAX_PCT', 20)
+const SIM_TRAIL_DD_ROI_MIN_PCT = numEnv('SIM_TRAIL_DD_ROI_MIN_PCT', 2)
+const SIM_TRAIL_DD_ROI_MAX_PCT = numEnv('SIM_TRAIL_DD_ROI_MAX_PCT', 4)
 const SIM_MIN_NET_PROFIT_USD = numEnv('SIM_MIN_NET_PROFIT_USD', 0.2)
 const SIM_FEE_RATE_PCT = numEnv('SIM_FEE_RATE_PCT', 0.05)
 
 const BINANCE_FUTURES_REST_BASE = process.env.BINANCE_FUTURES_REST_BASE || 'https://fapi.binance.com'
 const BINANCE_FUTURES_WS_BASE = process.env.BINANCE_FUTURES_WS_BASE || 'wss://fstream.binance.com/stream?streams='
 
-const STREAM_TYPES = ['trade', 'markPrice@1s', `kline_${HISTORY_INTERVAL}`]
+const STREAM_TYPES = ['aggTrade', 'markPrice@1s', `kline_${HISTORY_INTERVAL}`]
 const STREAM_NAMES = Object.values(MARKET_SYMBOLS).flatMap((marketSymbol) => STREAM_TYPES.map((streamType) => `${marketSymbol}@${streamType}`))
 const BINANCE_WS_URL = `${BINANCE_FUTURES_WS_BASE}${STREAM_NAMES.join('/')}`
 
@@ -67,9 +70,12 @@ module.exports = {
   SIM_LEVERAGE,
   SIM_MARGIN_USD,
   SIM_MIN_NET_PROFIT_USD,
-  SIM_SL_ROI_PCT,
-  SIM_TRAIL_ACTIVATE_ROI_PCT,
-  SIM_TRAIL_DD_ROI_PCT,
+  SIM_SL_ROI_MAX_PCT,
+  SIM_SL_ROI_MIN_PCT,
+  SIM_TRAIL_ACTIVATE_ROI_MAX_PCT,
+  SIM_TRAIL_ACTIVATE_ROI_MIN_PCT,
+  SIM_TRAIL_DD_ROI_MAX_PCT,
+  SIM_TRAIL_DD_ROI_MIN_PCT,
   STREAM_NAMES,
   SYMBOLS,
   WS_PING_INTERVAL_MS,

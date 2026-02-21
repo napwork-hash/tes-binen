@@ -45,7 +45,7 @@ function analyzeDecision(candles, lastPrice, msToNextCandle) {
   if (!Number.isFinite(msToNextCandle) || msToNextCandle > DECISION_WINDOW_MS) {
     return {
       status: 'WAIT',
-      reason: 'Outside decision window (<1m)',
+      reason: 'Outside decision window',
       longAbove: null,
       shortBelow: null,
       triggerPct: 0,

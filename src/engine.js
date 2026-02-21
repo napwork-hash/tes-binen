@@ -16,9 +16,12 @@ const {
   SIM_LEVERAGE,
   SIM_MARGIN_USD,
   SIM_MIN_NET_PROFIT_USD,
-  SIM_SL_ROI_PCT,
-  SIM_TRAIL_ACTIVATE_ROI_PCT,
-  SIM_TRAIL_DD_ROI_PCT,
+  SIM_SL_ROI_MAX_PCT,
+  SIM_SL_ROI_MIN_PCT,
+  SIM_TRAIL_ACTIVATE_ROI_MAX_PCT,
+  SIM_TRAIL_ACTIVATE_ROI_MIN_PCT,
+  SIM_TRAIL_DD_ROI_MAX_PCT,
+  SIM_TRAIL_DD_ROI_MIN_PCT,
   SYMBOLS,
   WS_PING_INTERVAL_MS,
   WS_STALE_TIMEOUT_MS,
@@ -35,9 +38,12 @@ const { createSymbolSimState, getOpenTradeMetrics, maybeOpenTrade, updateOpenTra
 const SIM_CONFIG = {
   marginUsd: SIM_MARGIN_USD,
   leverage: SIM_LEVERAGE,
-  stopLossRoiPct: SIM_SL_ROI_PCT,
-  trailActivateRoiPct: SIM_TRAIL_ACTIVATE_ROI_PCT,
-  trailDdRoiPct: SIM_TRAIL_DD_ROI_PCT,
+  stopLossRoiMinPct: SIM_SL_ROI_MIN_PCT,
+  stopLossRoiMaxPct: SIM_SL_ROI_MAX_PCT,
+  trailActivateRoiMinPct: SIM_TRAIL_ACTIVATE_ROI_MIN_PCT,
+  trailActivateRoiMaxPct: SIM_TRAIL_ACTIVATE_ROI_MAX_PCT,
+  trailDdRoiMinPct: SIM_TRAIL_DD_ROI_MIN_PCT,
+  trailDdRoiMaxPct: SIM_TRAIL_DD_ROI_MAX_PCT,
   minNetProfitUsd: SIM_MIN_NET_PROFIT_USD,
   feeRatePct: SIM_FEE_RATE_PCT,
 }
@@ -248,6 +254,7 @@ function syncDecisionPlan(symbol, state, analysis, livePrice, now) {
           cycleId,
           status: analysis.status,
           reason: analysis.reason,
+          triggerPct: analysis.triggerPct,
           basePrice: livePrice,
           longAbove: analysis.longAbove,
           shortBelow: analysis.shortBelow,
@@ -264,6 +271,7 @@ function syncDecisionPlan(symbol, state, analysis, livePrice, now) {
   if (prevPlan.status !== 'SETUP' && analysis.status === 'SETUP' && canBuild) {
     prevPlan.status = analysis.status
     prevPlan.reason = analysis.reason
+    prevPlan.triggerPct = analysis.triggerPct
     prevPlan.basePrice = livePrice
     prevPlan.longAbove = analysis.longAbove
     prevPlan.shortBelow = analysis.shortBelow
@@ -320,8 +328,9 @@ function render(rows) {
   console.log(
     `History: ${HISTORY_CANDLES} candles x ${HISTORY_INTERVAL} (6 jam) | Decision window: < ${Math.floor(DECISION_WINDOW_MS / 1000)} detik | ` +
       `Sim: $${SIM_CONFIG.marginUsd} x${SIM_CONFIG.leverage} | ` +
-      `SL -${SIM_CONFIG.stopLossRoiPct}% ROI | ` +
-      `Trail DD ${SIM_CONFIG.trailDdRoiPct}% ROI (aktif >= ${SIM_CONFIG.trailActivateRoiPct}% ROI) | ` +
+      `SL -${SIM_CONFIG.stopLossRoiMinPct}-${SIM_CONFIG.stopLossRoiMaxPct}% ROI | ` +
+      `Trail aktif ${SIM_CONFIG.trailActivateRoiMinPct}-${SIM_CONFIG.trailActivateRoiMaxPct}% ROI | ` +
+      `Trail DD ${SIM_CONFIG.trailDdRoiMinPct}-${SIM_CONFIG.trailDdRoiMaxPct}% ROI | ` +
       `Min net +$${SIM_CONFIG.minNetProfitUsd.toFixed(2)} | ` +
       `Fee ${SIM_CONFIG.feeRatePct}%/side\n`,
   )
@@ -377,7 +386,7 @@ function render(rows) {
           `entry ${formatPrice(trade.entryPrice)} | ` +
           `last ${formatPrice(livePrice)} | ` +
           `slROI -${trade.stopLossRoiPct}% | ` +
-          `trail ${trade.trailingArmed ? 'ON' : 'OFF'} | ` +
+          `trail ${trade.trailingArmed ? 'ON' : 'OFF'} (act ${trade.trailActivateRoiPct.toFixed(2)}% / dd ${trade.trailDdRoiPct.toFixed(2)}%) | ` +
           `peakROI ${peakRoiPct.toFixed(2)}% | ` +
           `gross ${grossSign}$${grossPnlUsd.toFixed(4)} | ` +
           `fee $${feesUsd.toFixed(4)} | ` +

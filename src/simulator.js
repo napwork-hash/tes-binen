@@ -9,13 +9,29 @@ function isValidPrice(value) {
   return typeof value === 'number' && Number.isFinite(value) && !Number.isNaN(value) && value > 0
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value))
+}
+
 function createDefaults(simConfig) {
+  const slMin = Math.max(1, toNumber(simConfig.stopLossRoiMinPct, 8))
+  const slMax = Math.max(slMin, toNumber(simConfig.stopLossRoiMaxPct, 15))
+
+  const trailActivateMin = Math.max(0.1, toNumber(simConfig.trailActivateRoiMinPct, 10))
+  const trailActivateMax = Math.max(trailActivateMin, toNumber(simConfig.trailActivateRoiMaxPct, 20))
+
+  const trailDdMin = Math.max(0.1, toNumber(simConfig.trailDdRoiMinPct, 2))
+  const trailDdMax = Math.max(trailDdMin, toNumber(simConfig.trailDdRoiMaxPct, 4))
+
   return {
     marginUsd: Math.max(0.1, toNumber(simConfig.marginUsd, 10)),
     leverage: Math.max(1, toNumber(simConfig.leverage, 20)),
-    stopLossRoiPct: Math.max(1, toNumber(simConfig.stopLossRoiPct, 30)),
-    trailActivateRoiPct: Math.max(0.1, toNumber(simConfig.trailActivateRoiPct, 10)),
-    trailDdRoiPct: Math.max(0.1, toNumber(simConfig.trailDdRoiPct, 3)),
+    stopLossRoiMinPct: slMin,
+    stopLossRoiMaxPct: slMax,
+    trailActivateRoiMinPct: trailActivateMin,
+    trailActivateRoiMaxPct: trailActivateMax,
+    trailDdRoiMinPct: trailDdMin,
+    trailDdRoiMaxPct: trailDdMax,
     minNetProfitUsd: Math.max(0, toNumber(simConfig.minNetProfitUsd, 0.2)),
     feeRatePct: Math.max(0, toNumber(simConfig.feeRatePct, 0.05)),
   }
@@ -40,8 +56,20 @@ function calculateRoiPct(pnlUsd, marginUsd) {
   return (pnlUsd / marginUsd) * 100
 }
 
+function interpolateByTrigger(min, max, triggerPct) {
+  const floor = 0.08
+  const ceiling = 1.8
+  const safeTrigger = Number.isFinite(triggerPct) ? triggerPct : floor
+  const t = clamp((safeTrigger - floor) / (ceiling - floor), 0, 1)
+  return min + (max - min) * t
+}
+
 function createTrade(side, entryPrice, now, config, meta = {}) {
   if (!isValidPrice(entryPrice)) return null
+
+  const stopLossRoiPct = interpolateByTrigger(config.stopLossRoiMinPct, config.stopLossRoiMaxPct, meta.setupTriggerPct)
+  const trailActivateRoiPct = interpolateByTrigger(config.trailActivateRoiMinPct, config.trailActivateRoiMaxPct, meta.setupTriggerPct)
+  const trailDdRoiPct = interpolateByTrigger(config.trailDdRoiMinPct, config.trailDdRoiMaxPct, meta.setupTriggerPct)
 
   const positionValueUsd = config.marginUsd * config.leverage
   const quantity = positionValueUsd / entryPrice
@@ -60,9 +88,9 @@ function createTrade(side, entryPrice, now, config, meta = {}) {
     positionValueUsd,
     quantity,
 
-    stopLossRoiPct: config.stopLossRoiPct,
-    trailActivateRoiPct: config.trailActivateRoiPct,
-    trailDdRoiPct: config.trailDdRoiPct,
+    stopLossRoiPct,
+    trailActivateRoiPct,
+    trailDdRoiPct,
     minNetProfitUsd: config.minNetProfitUsd,
     feeRatePct: config.feeRatePct,
 
@@ -145,6 +173,7 @@ function maybeOpenTrade(simState, decisionPlan, livePrice, now, simConfig) {
     cycleId: decisionPlan.cycleId,
     triggerLongAbove: decisionPlan.longAbove,
     triggerShortBelow: decisionPlan.shortBelow,
+    setupTriggerPct: decisionPlan.triggerPct,
   })
   if (!nextTrade) return null
 

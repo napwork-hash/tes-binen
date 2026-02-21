@@ -91,7 +91,7 @@ function normalizeStreamEvent(payload) {
   const stream = typeof payload?.stream === 'string' ? payload.stream : ''
   const streamMarketSymbol = stream.split('@')[0]
 
-  if (data.e === 'trade') {
+  if (data.e === 'trade' || data.e === 'aggTrade') {
     const marketSymbol = (data.s || streamMarketSymbol || '').toLowerCase()
     return {
       type: 'trade',
