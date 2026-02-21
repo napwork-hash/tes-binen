@@ -6,8 +6,11 @@ const {
   BINANCE_WS_URL,
   DECISION_WINDOW_MS,
   FIVE_MINUTES_MS,
+  FLOW_LOOKBACK_MS,
   HISTORY_CANDLES,
   HISTORY_INTERVAL,
+  LIVE_TRADING_ENABLE,
+  LIVE_TRADING_TESTNET,
   MARKET_SYMBOLS,
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
@@ -29,11 +32,12 @@ const {
 
 const { formatMsToClock, formatNumber, formatPrice, safeClearConsole } = require('./utils')
 
-const { fetchKlineHistory, normalizeStreamEvent, parseRawSocketMessage, parseSocketPayload } = require('./binance')
+const { fetchFuturesCommissionRatePct, fetchKlineHistory, normalizeStreamEvent, parseRawSocketMessage, parseSocketPayload } = require('./binance')
 
 const { analyzeDecision } = require('./strategy')
 
 const { createSymbolSimState, getOpenTradeMetrics, maybeOpenTrade, updateOpenTrade } = require('./simulator')
+const { LiveTrader } = require('./liveTrader')
 
 const SIM_CONFIG = {
   marginUsd: SIM_MARGIN_USD,
@@ -46,6 +50,12 @@ const SIM_CONFIG = {
   trailDdRoiMaxPct: SIM_TRAIL_DD_ROI_MAX_PCT,
   minNetProfitUsd: SIM_MIN_NET_PROFIT_USD,
   feeRatePct: SIM_FEE_RATE_PCT,
+}
+const LIVE_TRADING_CONFIG = {
+  enable: LIVE_TRADING_ENABLE,
+  testnet: LIVE_TRADING_TESTNET,
+  marginUsd: SIM_MARGIN_USD,
+  leverage: SIM_LEVERAGE,
 }
 
 const symbolByMarket = new Map(Object.entries(MARKET_SYMBOLS).map(([symbol, marketSymbol]) => [marketSymbol, symbol]))
@@ -62,6 +72,7 @@ const symbolState = new Map(
       tradePrice: null,
       tradeQty: null,
       tradeTs: null,
+      aggTrades: [],
       lastVolume5m: null,
       nextCandleCloseTs: null,
       lastStreamAt: null,
@@ -72,6 +83,9 @@ const symbolState = new Map(
 
 const decisionPlanBySymbol = new Map(SYMBOLS.map((symbol) => [symbol, null]))
 const simStateBySymbol = new Map(SYMBOLS.map((symbol) => [symbol, createSymbolSimState()]))
+const feeRateBySymbolPct = new Map(SYMBOLS.map((symbol) => [symbol, SIM_CONFIG.feeRatePct]))
+const feeRateLoadedByApi = new Set()
+const liveTrader = new LiveTrader(LIVE_TRADING_CONFIG)
 
 let ws = null
 let wsConnected = false
@@ -81,6 +95,7 @@ let reconnectTimer = null
 let reconnectAttempt = 0
 let pingTimer = null
 let renderTimer = null
+let accountSyncTimer = null
 let hasShutdownHandlers = false
 
 let WebSocketImpl = globalThis.WebSocket
@@ -127,6 +142,7 @@ function ensureState(symbol) {
     tradePrice: null,
     tradeQty: null,
     tradeTs: null,
+    aggTrades: [],
     lastVolume5m: null,
     nextCandleCloseTs: null,
     lastStreamAt: null,
@@ -166,6 +182,39 @@ function upsertClosedCandle(state, candle) {
   }
 }
 
+function pruneAggTrades(state, nowTs) {
+  if (!Array.isArray(state.aggTrades) || state.aggTrades.length === 0) return
+  const keepFrom = nowTs - FLOW_LOOKBACK_MS
+  while (state.aggTrades.length > 0 && state.aggTrades[0].ts < keepFrom) {
+    state.aggTrades.shift()
+  }
+}
+
+function getTradeFlowMetrics(state, nowTs) {
+  pruneAggTrades(state, nowTs)
+
+  if (!Array.isArray(state.aggTrades) || state.aggTrades.length === 0) {
+    return { samples: 0, buyQty: 0, sellQty: 0, imbalance: 0 }
+  }
+
+  let buyQty = 0
+  let sellQty = 0
+  for (const t of state.aggTrades) {
+    if (t.side === 'buy') buyQty += t.qty
+    else sellQty += t.qty
+  }
+
+  const total = buyQty + sellQty
+  const imbalance = total > 0 ? (buyQty - sellQty) / total : 0
+
+  return {
+    samples: state.aggTrades.length,
+    buyQty,
+    sellQty,
+    imbalance,
+  }
+}
+
 function applyStreamEvent(event) {
   const symbol = symbolByMarket.get(event.marketSymbol)
   if (!symbol) return
@@ -178,6 +227,16 @@ function applyStreamEvent(event) {
     if (Number.isFinite(event.price)) state.tradePrice = event.price
     if (Number.isFinite(event.qty)) state.tradeQty = event.qty
     if (Number.isFinite(event.ts)) state.tradeTs = event.ts
+
+    if (Number.isFinite(event.qty) && event.qty > 0 && Number.isFinite(event.ts)) {
+      if (!Array.isArray(state.aggTrades)) state.aggTrades = []
+      state.aggTrades.push({
+        ts: event.ts,
+        qty: event.qty,
+        side: event.isBuyerMaker ? 'sell' : 'buy',
+      })
+      pruneAggTrades(state, event.ts)
+    }
     return
   }
 
@@ -255,6 +314,8 @@ function syncDecisionPlan(symbol, state, analysis, livePrice, now) {
           status: analysis.status,
           reason: analysis.reason,
           triggerPct: analysis.triggerPct,
+          flowImbalance: analysis.flowImbalance,
+          flowSamples: analysis.flowSamples,
           basePrice: livePrice,
           longAbove: analysis.longAbove,
           shortBelow: analysis.shortBelow,
@@ -272,6 +333,8 @@ function syncDecisionPlan(symbol, state, analysis, livePrice, now) {
     prevPlan.status = analysis.status
     prevPlan.reason = analysis.reason
     prevPlan.triggerPct = analysis.triggerPct
+    prevPlan.flowImbalance = analysis.flowImbalance
+    prevPlan.flowSamples = analysis.flowSamples
     prevPlan.basePrice = livePrice
     prevPlan.longAbove = analysis.longAbove
     prevPlan.shortBelow = analysis.shortBelow
@@ -294,14 +357,30 @@ function buildRows(now) {
     const state = ensureState(symbol)
     const livePrice = getLivePrice(state)
     const msToNext = getMsToNextCandle(state)
-    const analysis = analyzeDecision(state.candles, livePrice, msToNext)
+    const flowMetrics = getTradeFlowMetrics(state, now)
+    const analysis = analyzeDecision(state.candles, livePrice, msToNext, {
+      imbalance: flowMetrics.imbalance,
+      samples: flowMetrics.samples,
+    })
     const decisionPlan = syncDecisionPlan(symbol, state, analysis, livePrice, now)
 
     const sim = ensureSimState(symbol)
+    const symbolFeeRatePct = feeRateBySymbolPct.get(symbol) ?? SIM_CONFIG.feeRatePct
+    const symbolSimConfig = {
+      ...SIM_CONFIG,
+      feeRatePct: symbolFeeRatePct,
+    }
 
     if (isFinitePrice(livePrice)) {
-      updateOpenTrade(sim, livePrice, now)
-      maybeOpenTrade(sim, decisionPlan, livePrice, now, SIM_CONFIG)
+      const closedTrade = updateOpenTrade(sim, livePrice, now)
+      if (closedTrade) {
+        void liveTrader.closePosition(symbol, state.marketSymbol)
+      }
+
+      const openedTrade = maybeOpenTrade(sim, decisionPlan, livePrice, now, symbolSimConfig)
+      if (openedTrade) {
+        void liveTrader.openPosition(symbol, state.marketSymbol, openedTrade.side, livePrice)
+      }
     }
 
     const simOpenMetrics = getOpenTradeMetrics(sim, livePrice)
@@ -312,9 +391,12 @@ function buildRows(now) {
       livePrice,
       msToNext,
       analysis,
+      flowMetrics,
       decisionPlan,
       sim,
       simOpenMetrics,
+      livePosition: liveTrader.getPosition(String(state.marketSymbol).toUpperCase()),
+      liveIncome: liveTrader.getIncomeStats(String(state.marketSymbol).toUpperCase()),
     })
   }
 
@@ -323,6 +405,7 @@ function buildRows(now) {
 
 function render(rows) {
   safeClearConsole()
+  const customFeeCount = feeRateLoadedByApi.size
 
   console.log('Live Binance Futures Monitor (Trade + Mark + Volume)')
   console.log(
@@ -332,8 +415,10 @@ function render(rows) {
       `Trail aktif ${SIM_CONFIG.trailActivateRoiMinPct}-${SIM_CONFIG.trailActivateRoiMaxPct}% ROI | ` +
       `Trail DD ${SIM_CONFIG.trailDdRoiMinPct}-${SIM_CONFIG.trailDdRoiMaxPct}% ROI | ` +
       `Min net +$${SIM_CONFIG.minNetProfitUsd.toFixed(2)} | ` +
-      `Fee ${SIM_CONFIG.feeRatePct}%/side\n`,
+      `Fee fallback ${SIM_CONFIG.feeRatePct}%/side | fee API loaded ${customFeeCount}/${SYMBOLS.length}\n`,
   )
+  const liveErrorText = liveTrader.lastError ? ` | ${liveTrader.lastError}` : ''
+  console.log(`Live trading: ${liveTrader.getStatus()}${liveErrorText}`)
   console.log(`WebSocket: ${connectionStatusText()}`)
   console.log('SYMBOL | MARK         | TRADE        | VOL 5M   | NEXT   | PLAN      | LONG IF >     | SHORT IF <    | SIM  | NOTE')
   console.log('--------------------------------------------------------------------------------------------------------------------------------')
@@ -367,9 +452,40 @@ function render(rows) {
 
   console.log('\nSimulation Trades')
   console.log('-----------------')
+  if (liveTrader.isEnabled()) console.log('Using live Binance position/income snapshot')
 
   for (const row of rows) {
-    const { symbol, livePrice, sim, simOpenMetrics } = row
+    const { symbol, livePrice, sim, simOpenMetrics, livePosition, liveIncome } = row
+
+    if (liveTrader.isEnabled()) {
+      if (livePosition) {
+        const upnl = livePosition.unrealizedPnlUsd ?? 0
+        const upnlSign = upnl >= 0 ? '+' : ''
+        const roeDenom = livePosition.marginUsd > 0 ? livePosition.marginUsd : SIM_CONFIG.marginUsd
+        const roePct = (upnl / roeDenom) * 100
+
+        console.log(
+          `${symbol} LIVE ${livePosition.side.toUpperCase()} | ` +
+            `entry ${formatPrice(livePosition.entryPrice)} | ` +
+            `mark ${formatPrice(livePosition.markPrice)} | ` +
+            `qty ${formatNumber(livePosition.quantity, 4)} | ` +
+            `uPnL ${upnlSign}$${upnl.toFixed(4)} (${roePct.toFixed(2)}%) | ` +
+            `notional $${(livePosition.notionalUsd || 0).toFixed(2)}`,
+        )
+      } else {
+        const net = liveIncome.netUsd || 0
+        const sign = net >= 0 ? '+' : ''
+        console.log(
+          `${symbol} LIVE IDLE | ` +
+            `realized ${(liveIncome.realizedPnlUsd || 0) >= 0 ? '+' : ''}$${(liveIncome.realizedPnlUsd || 0).toFixed(4)} | ` +
+            `commission $${(liveIncome.commissionUsd || 0).toFixed(4)} | ` +
+            `funding $${(liveIncome.fundingUsd || 0).toFixed(4)} | ` +
+            `net ${sign}$${net.toFixed(4)} | ` +
+            `events ${liveIncome.events || 0}`,
+        )
+      }
+      continue
+    }
 
     if (sim.activeTrade) {
       const trade = sim.activeTrade
@@ -389,7 +505,7 @@ function render(rows) {
           `trail ${trade.trailingArmed ? 'ON' : 'OFF'} (act ${trade.trailActivateRoiPct.toFixed(2)}% / dd ${trade.trailDdRoiPct.toFixed(2)}%) | ` +
           `peakROI ${peakRoiPct.toFixed(2)}% | ` +
           `gross ${grossSign}$${grossPnlUsd.toFixed(4)} | ` +
-          `fee $${feesUsd.toFixed(4)} | ` +
+          `feeRate ${trade.feeRatePct.toFixed(4)}% | fee $${feesUsd.toFixed(4)} | ` +
           `net ${pnlSign}$${pnlUsd.toFixed(4)} (${roiPct.toFixed(2)}%)`,
       )
 
@@ -534,6 +650,23 @@ async function hydrateHistory() {
   await Promise.all(SYMBOLS.map((symbol) => hydrateHistoryForSymbol(symbol)))
 }
 
+async function hydrateFeeRates() {
+  await Promise.all(
+    SYMBOLS.map(async (symbol) => {
+      try {
+        const marketSymbol = MARKET_SYMBOLS[symbol]
+        const feeRatePct = await fetchFuturesCommissionRatePct(marketSymbol)
+        if (typeof feeRatePct === 'number' && Number.isFinite(feeRatePct) && feeRatePct >= 0) {
+          feeRateBySymbolPct.set(symbol, feeRatePct)
+          feeRateLoadedByApi.add(symbol)
+        }
+      } catch {
+        // keep fallback SIM_FEE_RATE_PCT
+      }
+    }),
+  )
+}
+
 function tick() {
   ensureWebsocketHealthy()
   const rows = buildRows(Date.now())
@@ -552,6 +685,11 @@ function shutdown() {
       reconnectTimer = null
     }
 
+    if (accountSyncTimer) {
+      clearInterval(accountSyncTimer)
+      accountSyncTimer = null
+    }
+
     stopPing()
 
     if (ws && (ws.readyState === WS_STATE_OPEN || ws.readyState === WS_STATE_CONNECTING)) {
@@ -567,6 +705,13 @@ function shutdown() {
 
 async function boot() {
   await hydrateHistory()
+  await hydrateFeeRates()
+  await liveTrader.bootstrap(Object.values(MARKET_SYMBOLS))
+  if (liveTrader.isEnabled()) {
+    accountSyncTimer = setInterval(() => {
+      void liveTrader.syncRuntime(Object.values(MARKET_SYMBOLS))
+    }, 3000)
+  }
 
   connectWebSocket()
   tick()

@@ -1,6 +1,6 @@
 'use strict'
 
-const { DECISION_WINDOW_MS, HISTORY_CANDLES } = require('./config')
+const { DECISION_WINDOW_MS, FLOW_CONFIRM_THRESHOLD, FLOW_MIN_SAMPLES, HISTORY_CANDLES } = require('./config')
 const { clamp, stdDev } = require('./utils')
 
 function ema(values, period) {
@@ -21,7 +21,7 @@ function average(values) {
   return values.reduce((acc, v) => acc + v, 0) / values.length
 }
 
-function analyzeDecision(candles, lastPrice, msToNextCandle) {
+function analyzeDecision(candles, lastPrice, msToNextCandle, flowContext = null) {
   if (typeof lastPrice !== 'number' || Number.isNaN(lastPrice)) {
     return {
       status: 'WAIT',
@@ -77,7 +77,18 @@ function analyzeDecision(candles, lastPrice, msToNextCandle) {
   const avgVolume = average(volumes)
   const volumeRatio = avgVolume > 0 ? lastVolume / avgVolume : 0
 
-  const triggerPct = clamp(atrPct * 0.6 + volPct * 0.8, 0.08, 1.8)
+  const flowImbalanceRaw = Number(flowContext?.imbalance)
+  const flowSamplesRaw = Number(flowContext?.samples)
+  const hasFlow = Number.isFinite(flowImbalanceRaw) && Number.isFinite(flowSamplesRaw) && flowSamplesRaw >= FLOW_MIN_SAMPLES
+  const flowImbalance = hasFlow ? flowImbalanceRaw : 0
+  const flowSamples = hasFlow ? flowSamplesRaw : 0
+
+  const flowConflict = hasFlow && ((trendPct > 0 && flowImbalance < -FLOW_CONFIRM_THRESHOLD) || (trendPct < 0 && flowImbalance > FLOW_CONFIRM_THRESHOLD))
+  const flowSupport = hasFlow && ((trendPct > 0 && flowImbalance > FLOW_CONFIRM_THRESHOLD) || (trendPct < 0 && flowImbalance < -FLOW_CONFIRM_THRESHOLD))
+
+  const triggerBasePct = atrPct * 0.6 + volPct * 0.8
+  const triggerMultiplier = flowConflict ? 1.25 : flowSupport ? 0.85 : 1
+  const triggerPct = clamp(triggerBasePct * triggerMultiplier, 0.08, 2.2)
 
   const longAbove = lastPrice * (1 + triggerPct / 100)
   const shortBelow = lastPrice * (1 - triggerPct / 100)
@@ -92,17 +103,32 @@ function analyzeDecision(candles, lastPrice, msToNextCandle) {
       longAbove,
       shortBelow,
       triggerPct,
+      flowImbalance,
+      flowSamples,
     }
   }
 
   const bias = trendPct >= 0 ? 'LONG_BIAS' : 'SHORT_BIAS'
+  if (flowConflict) {
+    return {
+      status: 'SIDEWAYS',
+      reason: `${bias} conflict flow ${flowImbalance.toFixed(2)} (${flowSamples})`,
+      longAbove,
+      shortBelow,
+      triggerPct,
+      flowImbalance,
+      flowSamples,
+    }
+  }
 
   return {
     status: 'SETUP',
-    reason: `${bias} | trigger ${triggerPct.toFixed(3)}% | vol x${volumeRatio.toFixed(2)}`,
+    reason: `${bias} | trigger ${triggerPct.toFixed(3)}% | vol x${volumeRatio.toFixed(2)} | flow ${flowImbalance.toFixed(2)}`,
     longAbove,
     shortBelow,
     triggerPct,
+    flowImbalance,
+    flowSamples,
   }
 }
 

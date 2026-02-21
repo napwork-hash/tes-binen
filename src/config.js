@@ -18,7 +18,7 @@ function parseCoinsEnv(raw) {
   return Array.from(new Set(coins))
 }
 
-const DEFAULT_COINS = ['1000PEPE', '1000FLOKI', 'DOGE', 'INIT', 'BAS', 'MYX', 'ASTER', 'WLFI', 'PIPPIN', 'ARB', 'POWER', 'YGG', 'ZAMA', 'SENT', 'AZTEC', 'COLLECT', 'EUL']
+const DEFAULT_COINS = ['1000PEPE', 'MYX', 'PIPPIN']
 const SYMBOLS = parseCoinsEnv(process.env.COIN_LIST) ?? DEFAULT_COINS
 
 const MARKET_SYMBOLS = Object.fromEntries(SYMBOLS.map((symbol) => [symbol, `${symbol.toLowerCase()}usdt`]))
@@ -27,9 +27,12 @@ const HISTORY_INTERVAL = '5m'
 const HISTORY_CANDLES = numEnv('HISTORY_CANDLES', 72)
 const DECISION_WINDOW_MS = numEnv('DECISION_WINDOW_MS', FIVE_MINUTES_MS)
 const RENDER_INTERVAL_MS = numEnv('RENDER_INTERVAL_MS', 1_000)
+const FLOW_LOOKBACK_MS = numEnv('FLOW_LOOKBACK_MS', 60_000)
+const FLOW_MIN_SAMPLES = numEnv('FLOW_MIN_SAMPLES', 20)
+const FLOW_CONFIRM_THRESHOLD = numEnv('FLOW_CONFIRM_THRESHOLD', 0.08)
 
 // Simulation trade configuration
-const SIM_MARGIN_USD = numEnv('SIM_MARGIN_USD', 10)
+const SIM_MARGIN_USD = numEnv('SIM_MARGIN_USD', 1)
 const SIM_LEVERAGE = numEnv('SIM_LEVERAGE', 20)
 const SIM_SL_ROI_MIN_PCT = numEnv('SIM_SL_ROI_MIN_PCT', 8)
 const SIM_SL_ROI_MAX_PCT = numEnv('SIM_SL_ROI_MAX_PCT', 15)
@@ -39,6 +42,10 @@ const SIM_TRAIL_DD_ROI_MIN_PCT = numEnv('SIM_TRAIL_DD_ROI_MIN_PCT', 2)
 const SIM_TRAIL_DD_ROI_MAX_PCT = numEnv('SIM_TRAIL_DD_ROI_MAX_PCT', 4)
 const SIM_MIN_NET_PROFIT_USD = numEnv('SIM_MIN_NET_PROFIT_USD', 0.2)
 const SIM_FEE_RATE_PCT = numEnv('SIM_FEE_RATE_PCT', 0.05)
+
+// Live trading (disabled by default)
+const LIVE_TRADING_ENABLE = (process.env.LIVE_TRADING_ENABLE ?? '0') === '1'
+const LIVE_TRADING_TESTNET = (process.env.LIVE_TRADING_TESTNET ?? '0') === '1'
 
 const BINANCE_FUTURES_REST_BASE = process.env.BINANCE_FUTURES_REST_BASE || 'https://fapi.binance.com'
 const BINANCE_FUTURES_WS_BASE = process.env.BINANCE_FUTURES_WS_BASE || 'wss://fstream.binance.com/stream?streams='
@@ -60,12 +67,17 @@ module.exports = {
   DECISION_WINDOW_MS,
   DISABLE_CONSOLE_CLEAR,
   FIVE_MINUTES_MS,
+  FLOW_CONFIRM_THRESHOLD,
+  FLOW_LOOKBACK_MS,
+  FLOW_MIN_SAMPLES,
   HISTORY_CANDLES,
   HISTORY_INTERVAL,
   MARKET_SYMBOLS,
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
   RENDER_INTERVAL_MS,
+  LIVE_TRADING_ENABLE,
+  LIVE_TRADING_TESTNET,
   SIM_FEE_RATE_PCT,
   SIM_LEVERAGE,
   SIM_MARGIN_USD,

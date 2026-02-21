@@ -113,7 +113,9 @@ function calculateGrossPnl(trade, price) {
 
 function calculateNetPnl(trade, price) {
   const grossPnlUsd = calculateGrossPnl(trade, price)
-  const totalFeesUsd = (trade.entryFeeUsd || 0) + (trade.estimatedExitFeeUsd || 0)
+  const exitNotionalUsd = Math.abs((trade.quantity || 0) * price)
+  const exitFeeUsd = (exitNotionalUsd * (trade.feeRatePct || 0)) / 100
+  const totalFeesUsd = (trade.entryFeeUsd || 0) + exitFeeUsd
   const netPnlUsd = grossPnlUsd - totalFeesUsd
 
   return {
@@ -167,6 +169,11 @@ function maybeOpenTrade(simState, decisionPlan, livePrice, now, simConfig) {
 
   const side = livePrice >= decisionPlan.longAbove ? 'long' : livePrice <= decisionPlan.shortBelow ? 'short' : null
   if (!side) return null
+
+  if (Number.isFinite(decisionPlan.flowImbalance) && Number.isFinite(decisionPlan.flowSamples) && decisionPlan.flowSamples >= 20) {
+    if (side === 'long' && decisionPlan.flowImbalance < -0.05) return null
+    if (side === 'short' && decisionPlan.flowImbalance > 0.05) return null
+  }
 
   const config = createDefaults(simConfig)
   const nextTrade = createTrade(side, livePrice, now, config, {

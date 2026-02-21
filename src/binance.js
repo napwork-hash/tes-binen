@@ -1,12 +1,15 @@
 'use strict'
 
+const crypto = require('crypto')
 const https = require('https')
 
 const { BINANCE_FUTURES_REST_BASE, HISTORY_CANDLES, HISTORY_INTERVAL } = require('./config')
 
-function fetchJson(url) {
+function fetchJson(url, options = {}) {
+  const headers = options.headers ?? {}
+
   if (typeof fetch === 'function') {
-    return fetch(url).then(async (response) => {
+    return fetch(url, { headers }).then(async (response) => {
       if (!response.ok) {
         const body = await response.text()
         throw new Error(`HTTP ${response.status} ${body}`)
@@ -16,7 +19,7 @@ function fetchJson(url) {
   }
 
   return new Promise((resolve, reject) => {
-    const req = https.get(url, (res) => {
+    const req = https.get(url, { headers }, (res) => {
       let raw = ''
       res.on('data', (chunk) => {
         raw += chunk
@@ -37,6 +40,45 @@ function fetchJson(url) {
 
     req.on('error', reject)
   })
+}
+
+function buildSignedQuery(params, secret) {
+  const query = new URLSearchParams(params).toString()
+  const signature = crypto.createHmac('sha256', secret).update(query).digest('hex')
+  return `${query}&signature=${signature}`
+}
+
+function normalizeCommissionToPct(rawValue) {
+  const fee = Number(rawValue)
+  if (!Number.isFinite(fee) || fee < 0) return null
+  if (fee <= 1) return fee * 100
+  return fee
+}
+
+async function fetchFuturesCommissionRatePct(marketSymbol) {
+  const apiKey = process.env.BINANCE_FUTURES_API_KEY || process.env.BINANCE_API_KEY
+  const apiSecret = process.env.BINANCE_FUTURES_API_SECRET || process.env.BINANCE_API_SECRET
+  if (!apiKey || !apiSecret) return null
+
+  const symbol = marketSymbol.toUpperCase()
+  const queryWithSignature = buildSignedQuery(
+    {
+      symbol,
+      recvWindow: 5000,
+      timestamp: Date.now(),
+    },
+    apiSecret,
+  )
+
+  const endpoint = `${BINANCE_FUTURES_REST_BASE}/fapi/v1/commissionRate?${queryWithSignature}`
+  const payload = await fetchJson(endpoint, {
+    headers: {
+      'X-MBX-APIKEY': apiKey,
+    },
+  })
+
+  const takerFeePct = normalizeCommissionToPct(payload?.takerCommissionRate)
+  return takerFeePct
 }
 
 async function fetchKlineHistory(marketSymbol, interval = HISTORY_INTERVAL, limit = HISTORY_CANDLES) {
@@ -98,6 +140,7 @@ function normalizeStreamEvent(payload) {
       marketSymbol,
       price: Number(data.p),
       qty: Number(data.q),
+      isBuyerMaker: Boolean(data.m),
       ts: Number(data.T),
     }
   }
@@ -132,6 +175,7 @@ function normalizeStreamEvent(payload) {
 }
 
 module.exports = {
+  fetchFuturesCommissionRatePct,
   fetchKlineHistory,
   normalizeStreamEvent,
   parseRawSocketMessage,
