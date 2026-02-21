@@ -86,6 +86,10 @@ const simStateBySymbol = new Map(SYMBOLS.map((symbol) => [symbol, createSymbolSi
 const feeRateBySymbolPct = new Map(SYMBOLS.map((symbol) => [symbol, SIM_CONFIG.feeRatePct]))
 const feeRateLoadedByApi = new Set()
 const liveTrader = new LiveTrader(LIVE_TRADING_CONFIG)
+const liveControlBySymbol = new Map(SYMBOLS.map((symbol) => [symbol, null]))
+const liveEntryIntentBySymbol = new Map(SYMBOLS.map((symbol) => [symbol, null]))
+const LIVE_ENTRY_SYNC_RETRY_MS = 5_000
+const nextLiveEntryRetryAtBySymbol = new Map(SYMBOLS.map((symbol) => [symbol, 0]))
 
 let ws = null
 let wsConnected = false
@@ -296,6 +300,81 @@ function isFinitePrice(value) {
   return typeof value === 'number' && Number.isFinite(value) && !Number.isNaN(value) && value > 0
 }
 
+function toNumber(value, fallback) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function interpolateByTrigger(min, max, triggerPct) {
+  const floor = 0.08
+  const ceiling = 1.8
+  const safeTrigger = Number.isFinite(triggerPct) ? triggerPct : floor
+  const t = clamp((safeTrigger - floor) / (ceiling - floor), 0, 1)
+  return min + (max - min) * t
+}
+
+function buildRiskProfile(triggerPct, feeRatePct) {
+  return {
+    stopLossRoiPct: interpolateByTrigger(SIM_CONFIG.stopLossRoiMinPct, SIM_CONFIG.stopLossRoiMaxPct, triggerPct),
+    trailActivateRoiPct: interpolateByTrigger(SIM_CONFIG.trailActivateRoiMinPct, SIM_CONFIG.trailActivateRoiMaxPct, triggerPct),
+    trailDdRoiPct: interpolateByTrigger(SIM_CONFIG.trailDdRoiMinPct, SIM_CONFIG.trailDdRoiMaxPct, triggerPct),
+    minNetProfitUsd: SIM_CONFIG.minNetProfitUsd,
+    feeRatePct,
+  }
+}
+
+function flowConflicts(side, decisionPlan) {
+  if (!decisionPlan) return false
+  if (!Number.isFinite(decisionPlan.flowImbalance) || !Number.isFinite(decisionPlan.flowSamples) || decisionPlan.flowSamples < 20) return false
+  if (side === 'long' && decisionPlan.flowImbalance < -0.05) return true
+  if (side === 'short' && decisionPlan.flowImbalance > 0.05) return true
+  return false
+}
+
+function createLiveControlState(side, triggerPct, feeRatePct, now) {
+  const risk = buildRiskProfile(triggerPct, feeRatePct)
+  return {
+    side,
+    trailingArmed: false,
+    peakRoiPct: Number.NEGATIVE_INFINITY,
+    peakNetPnlUsd: Number.NEGATIVE_INFINITY,
+    openedAt: now,
+    setupTriggerPct: Number.isFinite(triggerPct) ? triggerPct : null,
+    ...risk,
+  }
+}
+
+function getLiveOpenMetrics(livePosition, livePrice, feeRatePct) {
+  if (!livePosition) return null
+
+  const qty = Math.abs(toNumber(livePosition.quantity, 0))
+  const entryPrice = toNumber(livePosition.entryPrice, 0)
+  const markPrice = isFinitePrice(livePosition.markPrice) ? livePosition.markPrice : livePrice
+  if (!isFinitePrice(markPrice)) return null
+
+  const grossPnlUsd = toNumber(livePosition.unrealizedPnlUsd, 0)
+  const notionalUsd = Math.abs(qty * markPrice)
+  const exitFeeUsd = (notionalUsd * Math.max(0, feeRatePct)) / 100
+  const netPnlUsd = grossPnlUsd - exitFeeUsd
+  const marginUsd = Math.max(0.0000001, toNumber(livePosition.marginUsd, SIM_CONFIG.marginUsd))
+  const roiPct = (netPnlUsd / marginUsd) * 100
+
+  return {
+    qty,
+    entryPrice,
+    markPrice,
+    grossPnlUsd,
+    feesUsd: exitFeeUsd,
+    netPnlUsd,
+    marginUsd,
+    roiPct,
+  }
+}
+
 function syncDecisionPlan(symbol, state, analysis, livePrice, now) {
   const cycleId = getCurrentCycleId(state)
   const prevPlan = decisionPlanBySymbol.get(symbol) ?? null
@@ -352,6 +431,7 @@ function connectionStatusText() {
 
 function buildRows(now) {
   const rows = []
+  const liveEnabled = liveTrader.isEnabled()
 
   for (const symbol of SYMBOLS) {
     const state = ensureState(symbol)
@@ -364,26 +444,113 @@ function buildRows(now) {
     })
     const decisionPlan = syncDecisionPlan(symbol, state, analysis, livePrice, now)
 
-    const sim = ensureSimState(symbol)
     const symbolFeeRatePct = feeRateBySymbolPct.get(symbol) ?? SIM_CONFIG.feeRatePct
-    const symbolSimConfig = {
-      ...SIM_CONFIG,
-      feeRatePct: symbolFeeRatePct,
-    }
+    const marketSymbolUpper = String(state.marketSymbol).toUpperCase()
+    let livePosition = liveTrader.getPosition(marketSymbolUpper)
+    let liveControl = liveControlBySymbol.get(symbol) ?? null
+    let liveEntryIntent = liveEntryIntentBySymbol.get(symbol) ?? null
+    const sim = ensureSimState(symbol)
+    const symbolSimConfig = { ...SIM_CONFIG, feeRatePct: symbolFeeRatePct }
 
-    if (isFinitePrice(livePrice)) {
-      const closedTrade = updateOpenTrade(sim, livePrice, now)
-      if (closedTrade) {
-        void liveTrader.closePosition(symbol, state.marketSymbol)
+    if (isFinitePrice(livePrice) && liveEnabled) {
+      if (livePosition) {
+        liveEntryIntentBySymbol.set(symbol, null)
+        liveEntryIntent = null
+        nextLiveEntryRetryAtBySymbol.set(symbol, 0)
+
+        if (!liveControl || liveControl.side !== livePosition.side) {
+          const triggerSeed = Number.isFinite(decisionPlan?.triggerPct) ? decisionPlan.triggerPct : 0.5
+          liveControl = createLiveControlState(livePosition.side, triggerSeed, symbolFeeRatePct, now)
+          liveControlBySymbol.set(symbol, liveControl)
+        }
+
+        const metrics = getLiveOpenMetrics(livePosition, livePrice, liveControl.feeRatePct)
+        if (metrics) {
+          if (metrics.netPnlUsd > liveControl.peakNetPnlUsd) {
+            liveControl.peakNetPnlUsd = metrics.netPnlUsd
+            liveControl.peakRoiPct = metrics.roiPct
+          }
+
+          if (!liveControl.trailingArmed && metrics.roiPct >= liveControl.trailActivateRoiPct) {
+            liveControl.trailingArmed = true
+          }
+
+          let closeReason = null
+          if (metrics.roiPct <= -liveControl.stopLossRoiPct) {
+            closeReason = 'SL_ROI'
+          } else if (liveControl.trailingArmed) {
+            const drawdownRoiPct = liveControl.peakRoiPct - metrics.roiPct
+            if (drawdownRoiPct >= liveControl.trailDdRoiPct && metrics.netPnlUsd >= liveControl.minNetProfitUsd) {
+              closeReason = 'TRAIL_ROI'
+            } else if (liveControl.peakNetPnlUsd >= liveControl.minNetProfitUsd && metrics.netPnlUsd <= liveControl.minNetProfitUsd) {
+              closeReason = 'LOCK_PROFIT'
+            }
+          }
+
+          if (closeReason) {
+            liveControl.lastExitSignal = closeReason
+            void liveTrader.closePosition(symbol, state.marketSymbol)
+          }
+        }
+      } else {
+        liveControlBySymbol.set(symbol, null)
+        liveControl = null
+
+        if (liveEntryIntent && now - liveEntryIntent.createdAt > FIVE_MINUTES_MS) {
+          liveEntryIntentBySymbol.set(symbol, null)
+          liveEntryIntent = null
+          nextLiveEntryRetryAtBySymbol.set(symbol, 0)
+        }
+
+        if (liveEntryIntent && Number.isFinite(decisionPlan?.cycleId) && liveEntryIntent.cycleId !== decisionPlan.cycleId) {
+          liveEntryIntentBySymbol.set(symbol, null)
+          liveEntryIntent = null
+          nextLiveEntryRetryAtBySymbol.set(symbol, 0)
+        }
+
+        if (
+          !liveEntryIntent &&
+          decisionPlan &&
+          decisionPlan.status === 'SETUP' &&
+          !decisionPlan.hasTriggered &&
+          isFinitePrice(decisionPlan.longAbove) &&
+          isFinitePrice(decisionPlan.shortBelow)
+        ) {
+          const side = livePrice >= decisionPlan.longAbove ? 'long' : livePrice <= decisionPlan.shortBelow ? 'short' : null
+          if (side && !flowConflicts(side, decisionPlan)) {
+            decisionPlan.hasTriggered = true
+            liveEntryIntent = {
+              side,
+              cycleId: decisionPlan.cycleId,
+              createdAt: now,
+            }
+            liveEntryIntentBySymbol.set(symbol, liveEntryIntent)
+            liveControl = createLiveControlState(side, decisionPlan.triggerPct, symbolFeeRatePct, now)
+            liveControlBySymbol.set(symbol, liveControl)
+            nextLiveEntryRetryAtBySymbol.set(symbol, now + LIVE_ENTRY_SYNC_RETRY_MS)
+            void liveTrader.openPosition(symbol, state.marketSymbol, side, livePrice)
+          }
+        } else if (liveEntryIntent) {
+          const nextRetryAt = nextLiveEntryRetryAtBySymbol.get(symbol) ?? 0
+          if (now >= nextRetryAt) {
+            nextLiveEntryRetryAtBySymbol.set(symbol, now + LIVE_ENTRY_SYNC_RETRY_MS)
+            void liveTrader.openPosition(symbol, state.marketSymbol, liveEntryIntent.side, livePrice)
+          }
+        }
       }
+    } else if (isFinitePrice(livePrice) && !liveEnabled) {
+      const closedTrade = updateOpenTrade(sim, livePrice, now)
+      if (closedTrade) nextLiveEntryRetryAtBySymbol.set(symbol, 0)
 
       const openedTrade = maybeOpenTrade(sim, decisionPlan, livePrice, now, symbolSimConfig)
-      if (openedTrade) {
-        void liveTrader.openPosition(symbol, state.marketSymbol, openedTrade.side, livePrice)
-      }
+      if (openedTrade) nextLiveEntryRetryAtBySymbol.set(symbol, now + LIVE_ENTRY_SYNC_RETRY_MS)
     }
 
-    const simOpenMetrics = getOpenTradeMetrics(sim, livePrice)
+    livePosition = liveTrader.getPosition(marketSymbolUpper)
+    liveControl = liveControlBySymbol.get(symbol) ?? null
+    liveEntryIntent = liveEntryIntentBySymbol.get(symbol) ?? null
+    const simOpenMetrics = liveEnabled ? null : getOpenTradeMetrics(sim, livePrice)
+    const liveOpenMetrics = liveEnabled ? getLiveOpenMetrics(livePosition, livePrice, symbolFeeRatePct) : null
 
     rows.push({
       symbol,
@@ -395,8 +562,12 @@ function buildRows(now) {
       decisionPlan,
       sim,
       simOpenMetrics,
-      livePosition: liveTrader.getPosition(String(state.marketSymbol).toUpperCase()),
-      liveIncome: liveTrader.getIncomeStats(String(state.marketSymbol).toUpperCase()),
+      livePosition,
+      liveIncome: liveTrader.getIncomeStats(marketSymbolUpper),
+      liveControl,
+      liveEntryIntent,
+      liveOpenMetrics,
+      liveLastAction: liveTrader.getLastAction(marketSymbolUpper),
     })
   }
 
@@ -406,11 +577,13 @@ function buildRows(now) {
 function render(rows) {
   safeClearConsole()
   const customFeeCount = feeRateLoadedByApi.size
+  const liveEnabled = liveTrader.isEnabled()
+  const posHeader = liveEnabled ? 'LIVE ' : 'SIM '
 
   console.log('Live Binance Futures Monitor (Trade + Mark + Volume)')
   console.log(
     `History: ${HISTORY_CANDLES} candles x ${HISTORY_INTERVAL} (6 jam) | Decision window: < ${Math.floor(DECISION_WINDOW_MS / 1000)} detik | ` +
-      `Sim: $${SIM_CONFIG.marginUsd} x${SIM_CONFIG.leverage} | ` +
+      `${liveEnabled ? 'Live' : 'Sim'}: $${SIM_CONFIG.marginUsd} x${SIM_CONFIG.leverage} | ` +
       `SL -${SIM_CONFIG.stopLossRoiMinPct}-${SIM_CONFIG.stopLossRoiMaxPct}% ROI | ` +
       `Trail aktif ${SIM_CONFIG.trailActivateRoiMinPct}-${SIM_CONFIG.trailActivateRoiMaxPct}% ROI | ` +
       `Trail DD ${SIM_CONFIG.trailDdRoiMinPct}-${SIM_CONFIG.trailDdRoiMaxPct}% ROI | ` +
@@ -420,11 +593,11 @@ function render(rows) {
   const liveErrorText = liveTrader.lastError ? ` | ${liveTrader.lastError}` : ''
   console.log(`Live trading: ${liveTrader.getStatus()}${liveErrorText}`)
   console.log(`WebSocket: ${connectionStatusText()}`)
-  console.log('SYMBOL | MARK         | TRADE        | VOL 5M   | NEXT   | PLAN      | LONG IF >     | SHORT IF <    | SIM  | NOTE')
+  console.log(`SYMBOL | MARK         | TRADE        | VOL 5M   | NEXT   | PLAN      | LONG IF >     | SHORT IF <    | ${posHeader}| NOTE`)
   console.log('--------------------------------------------------------------------------------------------------------------------------------')
 
   for (const row of rows) {
-    const { symbol, state, msToNext, analysis, decisionPlan, sim } = row
+    const { symbol, state, msToNext, analysis, decisionPlan, sim, livePosition, liveEntryIntent } = row
 
     const plan = decisionPlan ?? null
     const planStatus = (plan?.status ?? analysis.status).padEnd(9)
@@ -434,7 +607,7 @@ function render(rows) {
     const noteBase = state.error ? `ERR: ${state.error}` : (plan?.reason ?? analysis.reason)
     const note = String(noteBase || '-').slice(0, 40)
 
-    const simTag = sim.activeTrade ? sim.activeTrade.side.toUpperCase() : 'IDLE'
+    const posTag = liveEnabled ? (livePosition ? livePosition.side.toUpperCase() : liveEntryIntent ? 'PEND' : 'IDLE') : sim.activeTrade ? sim.activeTrade.side.toUpperCase() : 'IDLE'
 
     console.log(
       `${symbol.padEnd(8)} | ` +
@@ -445,43 +618,52 @@ function render(rows) {
         `${planStatus} | ` +
         `${longText} | ` +
         `${shortText} | ` +
-        `${simTag.padEnd(4)} | ` +
+        `${posTag.padEnd(4)} | ` +
         `${note}`,
     )
   }
 
-  console.log('\nSimulation Trades')
+  console.log(`\n${liveEnabled ? 'Live Trades' : 'Simulation Trades'}`)
   console.log('-----------------')
-  if (liveTrader.isEnabled()) console.log('Using live Binance position/income snapshot')
+  if (liveEnabled) console.log('Using live Binance positions/income + live open/close execution')
 
   for (const row of rows) {
-    const { symbol, livePrice, sim, simOpenMetrics, livePosition, liveIncome } = row
+    const { symbol, livePrice, sim, simOpenMetrics, livePosition, liveIncome, liveControl, liveEntryIntent, liveOpenMetrics, liveLastAction } = row
 
-    if (liveTrader.isEnabled()) {
+    if (liveEnabled) {
       if (livePosition) {
-        const upnl = livePosition.unrealizedPnlUsd ?? 0
-        const upnlSign = upnl >= 0 ? '+' : ''
-        const roeDenom = livePosition.marginUsd > 0 ? livePosition.marginUsd : SIM_CONFIG.marginUsd
-        const roePct = (upnl / roeDenom) * 100
+        const gross = liveOpenMetrics?.grossPnlUsd ?? 0
+        const net = liveOpenMetrics?.netPnlUsd ?? gross
+        const roiPct = liveOpenMetrics?.roiPct ?? 0
+        const grossSign = gross >= 0 ? '+' : ''
+        const netSign = net >= 0 ? '+' : ''
+        const controlText = liveControl
+          ? `sl -${liveControl.stopLossRoiPct.toFixed(2)}% | trail ${liveControl.trailingArmed ? 'ON' : 'OFF'} (act ${liveControl.trailActivateRoiPct.toFixed(2)}% / dd ${liveControl.trailDdRoiPct.toFixed(2)}%) | peakROI ${Number.isFinite(liveControl.peakRoiPct) ? liveControl.peakRoiPct.toFixed(2) : '0.00'}%`
+          : 'risk profile unavailable'
 
         console.log(
           `${symbol} LIVE ${livePosition.side.toUpperCase()} | ` +
             `entry ${formatPrice(livePosition.entryPrice)} | ` +
             `mark ${formatPrice(livePosition.markPrice)} | ` +
             `qty ${formatNumber(livePosition.quantity, 4)} | ` +
-            `uPnL ${upnlSign}$${upnl.toFixed(4)} (${roePct.toFixed(2)}%) | ` +
-            `notional $${(livePosition.notionalUsd || 0).toFixed(2)}`,
+            `gross ${grossSign}$${gross.toFixed(4)} | ` +
+            `netEst ${netSign}$${net.toFixed(4)} (${roiPct.toFixed(2)}%) | ` +
+            `${controlText} | ` +
+            `action ${liveLastAction}`,
         )
       } else {
         const net = liveIncome.netUsd || 0
         const sign = net >= 0 ? '+' : ''
+        const intentText = liveEntryIntent ? `pending ${liveEntryIntent.side.toUpperCase()}` : 'pending -'
         console.log(
           `${symbol} LIVE IDLE | ` +
             `realized ${(liveIncome.realizedPnlUsd || 0) >= 0 ? '+' : ''}$${(liveIncome.realizedPnlUsd || 0).toFixed(4)} | ` +
             `commission $${(liveIncome.commissionUsd || 0).toFixed(4)} | ` +
             `funding $${(liveIncome.fundingUsd || 0).toFixed(4)} | ` +
             `net ${sign}$${net.toFixed(4)} | ` +
-            `events ${liveIncome.events || 0}`,
+            `events ${liveIncome.events || 0} | ` +
+            `${intentText} | ` +
+            `action ${liveLastAction}`,
         )
       }
       continue

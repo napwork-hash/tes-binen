@@ -50,6 +50,7 @@ class LiveTrader {
     this.inFlight = new Set()
     this.positionSnapshot = new Map() // marketSymbolUpper -> { side, quantity, entryPrice, markPrice, unrealizedPnlUsd, notionalUsd, marginUsd }
     this.incomeStats = new Map() // marketSymbolUpper -> { realizedPnlUsd, commissionUsd, fundingUsd, netUsd, events }
+    this.lastActionBySymbol = new Map() // marketSymbolUpper -> short last action text
     this.incomeCursorTs = Date.now() - 60_000
     this.seenIncomeKeys = new Set()
 
@@ -229,10 +230,15 @@ class LiveTrader {
         quantity: executedQty > 0 ? executedQty : qty,
       })
 
+      this.lastActionBySymbol.set(
+        symbolUpper,
+        `OPEN ${side.toUpperCase()} ok qty ${formatQty(executedQty > 0 ? executedQty : qty)} #${result?.orderId ?? '-'}`,
+      )
       this.lastError = null
       await this.syncPositions()
       return result
     } catch (error) {
+      this.lastActionBySymbol.set(symbolUpper, `OPEN ${side.toUpperCase()} fail`)
       this.lastError = `Open ${symbolUpper} failed: ${error.message}`
       return null
     } finally {
@@ -244,7 +250,7 @@ class LiveTrader {
     if (!this.enable || !this.ready) return null
 
     const symbolUpper = String(marketSymbol || symbol).toUpperCase()
-    const active = this.activePositions.get(symbolUpper)
+    const active = this.activePositions.get(symbolUpper) || this.positionSnapshot.get(symbolUpper)
     if (!active) return null
     if (this.inFlight.has(symbolUpper)) return null
 
@@ -264,10 +270,12 @@ class LiveTrader {
       })
 
       this.activePositions.delete(symbolUpper)
+      this.lastActionBySymbol.set(symbolUpper, `CLOSE ${active.side.toUpperCase()} ok qty ${formatQty(qty)} #${result?.orderId ?? '-'}`)
       this.lastError = null
       await this.syncPositions()
       return result
     } catch (error) {
+      this.lastActionBySymbol.set(symbolUpper, `CLOSE ${active.side.toUpperCase()} fail`)
       this.lastError = `Close ${symbolUpper} failed: ${error.message}`
       return null
     } finally {
@@ -326,7 +334,6 @@ class LiveTrader {
     try {
       await this.syncPositions()
       await this.syncIncome(marketSymbols)
-      this.lastError = null
     } catch (error) {
       this.lastError = `Sync failed: ${error.message}`
     }
@@ -437,6 +444,18 @@ class LiveTrader {
       }
     )
   }
+
+  getLastAction(symbolUpper) {
+    return this.lastActionBySymbol.get(String(symbolUpper || '').toUpperCase()) ?? 'none'
+  }
+}
+
+function formatQty(value) {
+  const n = toNumber(value, 0)
+  if (!Number.isFinite(n) || n <= 0) return '0'
+  if (n >= 1000) return n.toFixed(2)
+  if (n >= 1) return n.toFixed(4)
+  return n.toFixed(6)
 }
 
 module.exports = {
