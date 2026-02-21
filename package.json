@@ -2,11 +2,14 @@
   "name": "coinglass-price-tracker",
   "version": "1.0.0",
   "private": true,
-  "description": "Live Coinglass price fetcher (console display only)",
+  "description": "Live Binance websocket kline streamer (console display only)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "live:pepe": "node live-pepe.js",
     "live:xau": "node live-xau.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.1"
   }
 }
