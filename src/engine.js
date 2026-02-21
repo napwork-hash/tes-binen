@@ -3,6 +3,7 @@
 'use strict'
 
 const {
+  ANALYSIS_MIN_CANDLES,
   BINANCE_WS_URL,
   DECISION_WINDOW_MS,
   FIVE_MINUTES_MS,
@@ -247,7 +248,7 @@ function applyStreamEvent(event) {
   state.lastStreamAt = Date.now()
   state.error = null
 
-  if (event.type === 'trade') {
+  if (event.type === 'trade' || event.type === 'aggTrade') {
     if (Number.isFinite(event.price)) state.tradePrice = event.price
     if (Number.isFinite(event.qty)) state.tradeQty = event.qty
     if (Number.isFinite(event.ts)) state.tradeTs = event.ts
@@ -338,12 +339,17 @@ function interpolateByTrigger(min, max, triggerPct) {
 }
 
 function buildRiskProfile(triggerPct, feeRatePct) {
+  const effectiveFeeRatePct = Number.isFinite(feeRatePct) ? Math.max(0, feeRatePct) : SIM_CONFIG.feeRatePct
+  const notionalUsd = Math.max(0, SIM_CONFIG.marginUsd * SIM_CONFIG.leverage)
+  const estRoundTripFeeUsd = notionalUsd * (effectiveFeeRatePct / 100) * 2
+  const adaptiveMinProfitUsd = Math.max(SIM_CONFIG.minNetProfitUsd, estRoundTripFeeUsd * 1.25)
+
   return {
     stopLossRoiPct: interpolateByTrigger(SIM_CONFIG.stopLossRoiMinPct, SIM_CONFIG.stopLossRoiMaxPct, triggerPct),
     trailActivateRoiPct: interpolateByTrigger(SIM_CONFIG.trailActivateRoiMinPct, SIM_CONFIG.trailActivateRoiMaxPct, triggerPct),
     trailDdRoiPct: interpolateByTrigger(SIM_CONFIG.trailDdRoiMinPct, SIM_CONFIG.trailDdRoiMaxPct, triggerPct),
-    minNetProfitUsd: SIM_CONFIG.minNetProfitUsd,
-    feeRatePct,
+    minNetProfitUsd: adaptiveMinProfitUsd,
+    feeRatePct: effectiveFeeRatePct,
   }
 }
 
@@ -602,7 +608,7 @@ function render(rows) {
 
   console.log('Live Binance Futures Monitor (Trade + Mark + Volume)')
   console.log(
-    `History: ${HISTORY_CANDLES} candles x ${HISTORY_INTERVAL} (6 jam) | Decision window: < ${Math.floor(DECISION_WINDOW_MS / 1000)} detik | ` +
+    `History: target ${HISTORY_CANDLES} candles x ${HISTORY_INTERVAL} (6 jam) | Analysis min: ${ANALYSIS_MIN_CANDLES} | Decision window: < ${Math.floor(DECISION_WINDOW_MS / 1000)} detik | ` +
       `${liveEnabled ? 'Live' : 'Sim'}: $${SIM_CONFIG.marginUsd} x${SIM_CONFIG.leverage} | ` +
       `SL -${SIM_CONFIG.stopLossRoiMinPct}-${SIM_CONFIG.stopLossRoiMaxPct}% ROI | ` +
       `Trail aktif ${SIM_CONFIG.trailActivateRoiMinPct}-${SIM_CONFIG.trailActivateRoiMaxPct}% ROI | ` +

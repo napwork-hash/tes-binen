@@ -32,7 +32,7 @@ function createDefaults(simConfig) {
     trailActivateRoiMaxPct: trailActivateMax,
     trailDdRoiMinPct: trailDdMin,
     trailDdRoiMaxPct: trailDdMax,
-    minNetProfitUsd: Math.max(0, toNumber(simConfig.minNetProfitUsd, 0.2)),
+    minNetProfitUsd: Math.max(0, toNumber(simConfig.minNetProfitUsd, 0.03)),
     feeRatePct: Math.max(0, toNumber(simConfig.feeRatePct, 0.05)),
   }
 }
@@ -78,6 +78,7 @@ function createTrade(side, entryPrice, now, config, meta = {}) {
   const entryFeeUsd = (positionValueUsd * config.feeRatePct) / 100
   const estimatedExitFeeUsd = (positionValueUsd * config.feeRatePct) / 100
   const netAtEntryUsd = -(entryFeeUsd + estimatedExitFeeUsd)
+  const minNetProfitUsd = Math.max(config.minNetProfitUsd, (entryFeeUsd + estimatedExitFeeUsd) * 1.25)
 
   return {
     side,
@@ -91,7 +92,7 @@ function createTrade(side, entryPrice, now, config, meta = {}) {
     stopLossRoiPct,
     trailActivateRoiPct,
     trailDdRoiPct,
-    minNetProfitUsd: config.minNetProfitUsd,
+    minNetProfitUsd,
     feeRatePct: config.feeRatePct,
 
     entryFeeUsd,

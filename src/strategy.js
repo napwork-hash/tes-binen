@@ -1,6 +1,16 @@
 'use strict'
 
-const { DECISION_WINDOW_MS, FLOW_CONFIRM_THRESHOLD, FLOW_MIN_SAMPLES, HISTORY_CANDLES } = require('./config')
+const {
+  ANALYSIS_MIN_CANDLES,
+  DECISION_WINDOW_MS,
+  FLOW_CONFIRM_THRESHOLD,
+  FLOW_MIN_SAMPLES,
+  HISTORY_CANDLES,
+  TRIGGER_ATR_WEIGHT,
+  TRIGGER_MAX_PCT,
+  TRIGGER_MIN_PCT,
+  TRIGGER_VOL_WEIGHT,
+} = require('./config')
 const { clamp, stdDev } = require('./utils')
 
 function ema(values, period) {
@@ -32,10 +42,10 @@ function analyzeDecision(candles, lastPrice, msToNextCandle, flowContext = null)
     }
   }
 
-  if (!Array.isArray(candles) || candles.length < HISTORY_CANDLES) {
+  if (!Array.isArray(candles) || candles.length < ANALYSIS_MIN_CANDLES) {
     return {
       status: 'WAIT',
-      reason: `Need ${HISTORY_CANDLES} candles (got ${candles?.length ?? 0})`,
+      reason: `Need >=${ANALYSIS_MIN_CANDLES} candles (target ${HISTORY_CANDLES}, got ${candles?.length ?? 0})`,
       longAbove: null,
       shortBelow: null,
       triggerPct: 0,
@@ -86,9 +96,20 @@ function analyzeDecision(candles, lastPrice, msToNextCandle, flowContext = null)
   const flowConflict = hasFlow && ((trendPct > 0 && flowImbalance < -FLOW_CONFIRM_THRESHOLD) || (trendPct < 0 && flowImbalance > FLOW_CONFIRM_THRESHOLD))
   const flowSupport = hasFlow && ((trendPct > 0 && flowImbalance > FLOW_CONFIRM_THRESHOLD) || (trendPct < 0 && flowImbalance < -FLOW_CONFIRM_THRESHOLD))
 
-  const triggerBasePct = atrPct * 0.6 + volPct * 0.8
-  const triggerMultiplier = flowConflict ? 1.25 : flowSupport ? 0.85 : 1
-  const triggerPct = clamp(triggerBasePct * triggerMultiplier, 0.08, 2.2)
+  const triggerBasePct = atrPct * TRIGGER_ATR_WEIGHT + volPct * TRIGGER_VOL_WEIGHT
+
+  let priceScale = 1
+  // Cheap meme coins often need tighter triggers, otherwise setup can idle too long.
+  if (lastPrice < 0.001) priceScale = 0.72
+  else if (lastPrice < 0.01) priceScale = 0.82
+  else if (lastPrice < 0.1) priceScale = 0.9
+
+  let liquidityScale = 1
+  if (volumeRatio >= 1.4) liquidityScale = 0.9
+  else if (volumeRatio <= 0.7) liquidityScale = 1.1
+
+  const flowScale = flowConflict ? 1.22 : flowSupport ? 0.86 : 1
+  const triggerPct = clamp(triggerBasePct * priceScale * liquidityScale * flowScale, TRIGGER_MIN_PCT, TRIGGER_MAX_PCT)
 
   const longAbove = lastPrice * (1 + triggerPct / 100)
   const shortBelow = lastPrice * (1 - triggerPct / 100)
